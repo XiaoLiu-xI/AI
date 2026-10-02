@@ -10,17 +10,17 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.manual_seed(1337)
 
 block_size = 128
-batch_size = 32
-n_embd = 128
-n_head = 4
-n_layer = 4
+batch_size = 16       # 从 32 降到 16，防止 OOM
+n_embd = 192          # 128 → 192
+n_head = 6            # 4 → 6
+n_layer = 6           # 4 → 6
 dropout = 0.1
-max_iters = 8000       # 从 3000 提到 8000
+max_iters = 10000     # 8000 → 10000
 eval_interval = 500
 eval_iters = 100
 lr = 3e-4
-warmup_iters = 200     # 前 200 步热身
-min_lr = 3e-5          # 最低学习率
+warmup_iters = 200
+min_lr = 3e-5
 
 # ============ 数据 ============
 if not os.path.exists("shakespeare.txt"):
