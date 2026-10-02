@@ -179,9 +179,18 @@ for step in range(max_iters):
 
     if step % eval_interval == 0 or step == max_iters - 1:
         losses = estimate_loss()
-        print(f"step {step:5d}  lr {lr_now:.2e}  train {losses['train']:.4f}  val {losses['val']:.4f}")
-
+        val_loss = losses['val']
+        flag = ""
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            flag = "  ← best"
+        print(f"step {step:5d}  lr {lr_now:.2e}  train {losses['train']:.4f}  val {val_loss:.4f}{flag}")
 # ============ 保存 ============
+if best_state is not None:
+    model.load_state_dict(best_state)
+    print(f"\n已回滚到最佳模型，val loss = {best_val_loss:.4f}")
+
 torch.save({
     "model": model.state_dict(),
     "stoi": stoi,
@@ -192,7 +201,7 @@ torch.save({
         "n_head": n_head,
         "n_layer": n_layer,
     }
-}, "minigpt.pt")
+}, "minigpt_zh.pt")
 print("\n模型已保存到 minigpt.pt")
 
 # ============ 生成 ============
