@@ -1,5 +1,6 @@
 import os
 import urllib.request
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,21 +9,23 @@ import torch.nn.functional as F
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.manual_seed(1337)
 
-block_size = 128        # 上下文长度
-batch_size = 32         # 每批样本数
-n_embd = 128            # 嵌入维度
-n_head = 4              # 注意力头数
-n_layer = 4             # Transformer 层数
+block_size = 128
+batch_size = 32
+n_embd = 128
+n_head = 4
+n_layer = 4
 dropout = 0.1
-max_iters = 3000
-eval_interval = 300
+max_iters = 8000       # 从 3000 提到 8000
+eval_interval = 500
+eval_iters = 100
 lr = 3e-4
+warmup_iters = 200     # 前 200 步热身
+min_lr = 3e-5          # 最低学习率
 
 # ============ 数据 ============
 if not os.path.exists("shakespeare.txt"):
     urls = [
         "https://cdn.jsdelivr.net/gh/karpathy/char-rnn@master/data/tinyshakespeare/input.txt",
-        "https://ghproxy.net/https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt",
     ]
     for u in urls:
         try:
@@ -36,8 +39,6 @@ chars = sorted(list(set(text)))
 stoi = {c: i for i, c in enumerate(chars)}
 itos = {i: c for c, i in stoi.items()}
 V = len(chars)
-print("vocab size:", V)
-
 encode = lambda s: [stoi[c] for c in s]
 decode = lambda l: "".join(itos[i] for i in l)
 
@@ -54,7 +55,6 @@ def get_batch(split):
 
 # ============ 模型 ============
 class Head(nn.Module):
-    """单个自注意力头"""
     def __init__(self, head_size):
         super().__init__()
         self.key = nn.Linear(n_embd, head_size, bias=False)
@@ -62,17 +62,14 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(dropout)
-
     def forward(self, x):
         B, T, C = x.shape
-        k = self.key(x)
-        q = self.query(x)
+        k = self.key(x); q = self.query(x)
         wei = q @ k.transpose(-2, -1) * (k.shape[-1] ** -0.5)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
-        v = self.value(x)
-        return wei @ v
+        return wei @ self.value(x)
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, n_head, head_size):
@@ -80,7 +77,6 @@ class MultiHeadAttention(nn.Module):
         self.heads = nn.ModuleList([Head(head_size) for _ in range(n_head)])
         self.proj = nn.Linear(n_embd, n_embd)
         self.dropout = nn.Dropout(dropout)
-
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         return self.dropout(self.proj(out))
@@ -94,7 +90,6 @@ class FeedForward(nn.Module):
             nn.Linear(4 * n_embd, n_embd),
             nn.Dropout(dropout),
         )
-
     def forward(self, x):
         return self.net(x)
 
@@ -106,7 +101,6 @@ class Block(nn.Module):
         self.ff = FeedForward()
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
-
     def forward(self, x):
         x = x + self.sa(self.ln1(x))
         x = x + self.ff(self.ln2(x))
@@ -120,7 +114,6 @@ class MiniGPT(nn.Module):
         self.blocks = nn.Sequential(*[Block() for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd)
         self.head = nn.Linear(n_embd, V)
-
     def forward(self, idx, targets=None):
         B, T = idx.shape
         tok = self.token_emb(idx)
@@ -132,7 +125,6 @@ class MiniGPT(nn.Module):
             return logits, None
         loss = F.cross_entropy(logits.view(B*T, V), targets.view(B*T))
         return logits, loss
-
     @torch.no_grad()
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
@@ -147,27 +139,65 @@ class MiniGPT(nn.Module):
 model = MiniGPT().to(device)
 print("参数量:", sum(p.numel() for p in model.parameters()))
 
+# ============ 学习率调度 ============
+def get_lr(it):
+    if it < warmup_iters:
+        return lr * (it + 1) / warmup_iters
+    if it > max_iters:
+        return min_lr
+    ratio = (it - warmup_iters) / (max_iters - warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
+    return min_lr + coeff * (lr - min_lr)
+
 # ============ 训练 ============
 optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ["train", "val"]:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            _, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean().item()
+    model.train()
+    return out
+
 for step in range(max_iters):
+    lr_now = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr_now
+
     xb, yb = get_batch("train")
     logits, loss = model(xb, yb)
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    if step % eval_interval == 0:
-        model.eval()
-        with torch.no_grad():
-            xv, yv = get_batch("val")
-            _, val_loss = model(xv, yv)
-        model.train()
-        print(f"step {step:4d}  train {loss.item():.4f}  val {val_loss.item():.4f}")
+    if step % eval_interval == 0 or step == max_iters - 1:
+        losses = estimate_loss()
+        print(f"step {step:5d}  lr {lr_now:.2e}  train {losses['train']:.4f}  val {losses['val']:.4f}")
+
+# ============ 保存 ============
+torch.save({
+    "model": model.state_dict(),
+    "stoi": stoi,
+    "itos": itos,
+    "config": {
+        "block_size": block_size,
+        "n_embd": n_embd,
+        "n_head": n_head,
+        "n_layer": n_layer,
+    }
+}, "minigpt.pt")
+print("\n模型已保存到 minigpt.pt")
 
 # ============ 生成 ============
 model.eval()
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-out = model.generate(context, max_new_tokens=500)[0].tolist()
+out = model.generate(context, max_new_tokens=800)[0].tolist()
 print("\n===== 生成样本 =====\n")
 print(decode(out))
